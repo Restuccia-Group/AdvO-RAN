@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+
+# Large local artifacts
+*.csv
+*.h5
+*.npz
+
+# Training/data outputs
+dataset/
+saved_policy/
+train_runs/
+
+# Misc
+.DS_Store
