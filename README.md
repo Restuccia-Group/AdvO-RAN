@@ -1,7 +1,8 @@
-# Adv-ORAN
+# AdvO-RAN: Adversarial Deep Reinforcement Learning in AI-Driven Open Radio Access Networks
+
 Adversarial and robust PPO workflows for AdvORAN.
 
-Here we have codes for train an agent, train an agent robustly with the help of adversarial learned perturbator in the training loop. 
+Here we have codes for train an EM-MAX agent for traffic profile 1, train an agent robustly with the help of adversarial learned perturbator in the training loop. 
 
 
 This repo `saved_policy/em-max/em-agent-lp` as the default victim policy.
