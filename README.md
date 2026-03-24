@@ -11,7 +11,7 @@ This repo `saved_policy/em-max/em-agent-lp` as the default victim policy.
 
 | Path | Purpose |
 | --- | --- |
-| `dataset/` | Input CSV files used by the environment and reward-model training | Download and Save csv files under dataset folder | [Download](https://drive.google.com/drive/folders/1xFQk5u293b_YNYp51WvM4NbRQCJFzA5O?usp=sharing)
+| `dataset/` | Input CSV files used by the environment and reward-model training | Download and Save csv files under dataset folder [Download](https://drive.google.com/drive/folders/1xFQk5u293b_YNYp51WvM4NbRQCJFzA5O?usp=sharing)| 
 | `saved_policy/em-max/em-agent-lp/` | Victim PPO policy snapshots (`actor.npz`, `value.npz`, `optimizer.npz`) |
 | `saved_policy/em-max/em-adversarial-agent/` | Reference adversarial policy used by the perturbator workflow |
 | `saved_policy/em-max/em-agent-lp-robust/` | Default output folder for robust PPO training |
