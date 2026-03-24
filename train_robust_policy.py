@@ -1,50 +1,140 @@
 #!/usr/bin/env python3
 
-
 import argparse
+import gc
+import glob
 import importlib
 import os
-import gc
+from typing import List, Optional
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
-import tensorflow as tf
 import numpy as np
+import tensorflow as tf
 from tf_agents.drivers import dynamic_step_driver
 from tf_agents.replay_buffers import tf_uniform_replay_buffer
 from tf_agents.system import system_multiprocessing as multiprocessing
 from tf_agents.utils import common
 
 import agent_builder
-import ran_env_wrapper
+import ran_env_robust_wrapper
+
+ROBUST_ENTROPY_REGULARIZATION = 0.1
+
+
+DEFAULT_INIT_POLICY_DIR_CANDIDATES = [
+    os.path.join(os.path.dirname(__file__), "saved_policy", "em-max", "em-agent-lp"),
+    os.path.join(os.path.dirname(__file__), "saved_policy", "em-max", "em-agent-filtered"),
+    os.path.join(os.path.dirname(__file__), "saved_policy", "em-agent-filtered"),
+]
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Modular DRL training launcher")
-    p.add_argument("--config_module", default="config_em_filtered", help="Config module, e.g. config_em_filtered")
-    p.add_argument("--algo", default="ppo", choices=["ppo"], help="DRL algorithm")
-
-    p.add_argument("--max_train_steps", type=int, default=None)
-    p.add_argument("--num_parallel_environments", type=int, default=None)
-    p.add_argument("--checkpoint_dir", default=None)
-    p.add_argument("--policy_dir", default=None)
-    p.add_argument("--log_dir", default=None)
-    p.add_argument(
+    parser = argparse.ArgumentParser(
+        description="Train a robust PPO policy with perturbed observations and inverse adversarial reward."
+    )
+    parser.add_argument("--config_module", default="config_em_filtered", help="Config module")
+    parser.add_argument("--algo", default="ppo", choices=["ppo"], help="DRL algorithm")
+    parser.add_argument(
+        "--policy_dir",
+        default=None,
+        help="Initial policy snapshot directory to sharpen; defaults to em-agent-lp if present",
+    )
+    parser.add_argument(
+        "--out_dir",
+        default=None,
+        help="Output directory for the robust policy snapshots",
+    )
+    parser.add_argument("--perturbator_path", default="pert.h5", help="Path to perturbator model")
+    parser.add_argument("--reward_model_path", default="reward_model.h5", help="Path to reward model")
+    parser.add_argument(
+        "--reward_slice_index",
+        type=int,
+        default=0,
+        help="Slice index whose [prb, sched] pair is scored by the reward model",
+    )
+    parser.add_argument(
+        "--reward_prb_max",
+        type=float,
+        default=None,
+        help="Optional PRB max used to normalize reward-model inputs",
+    )
+    parser.add_argument(
+        "--inverse_reward_mode",
+        choices=["negate", "reciprocal"],
+        default="reciprocal",
+        help="How to invert the adversarial reward for robust training",
+    )
+    parser.add_argument("--max_train_steps", type=int, default=None)
+    parser.add_argument("--num_parallel_environments", type=int, default=None)
+    parser.add_argument("--checkpoint_dir", default=None)
+    parser.add_argument("--log_dir", default=None)
+    parser.add_argument(
         "--resume_from_checkpoint",
         action="store_true",
-        help="Restore from latest checkpoint in checkpoint_dir before training",
+        help="Restore from latest checkpoint in checkpoint_dir after loading the init policy snapshot",
     )
-    p.add_argument(
+    parser.add_argument(
         "--action_print_top_k",
         type=int,
         default=8,
         help="Top-K most frequent actions to print at each log interval",
     )
+    parser.add_argument("--cpu_only", action="store_true", help="Force CPU-only at runtime")
+    parser.add_argument("--render_eval", action="store_true", help="Render eval environment each step")
+    return parser.parse_args()
 
-    p.add_argument("--cpu_only", action="store_true", help="Force CPU-only at runtime")
-    p.add_argument("--render_eval", action="store_true", help="Render eval environment each step")
-    return p.parse_args()
+
+def resolve_init_policy_dir(policy_dir: Optional[str] = None) -> str:
+    if policy_dir:
+        return policy_dir
+    for candidate in DEFAULT_INIT_POLICY_DIR_CANDIDATES:
+        if os.path.isdir(candidate):
+            return candidate
+    return DEFAULT_INIT_POLICY_DIR_CANDIDATES[0]
+
+
+def resolve_snapshot_file(policy_dir: str, prefix: str, ext: str, required: bool = True) -> str:
+    candidates = [os.path.join(policy_dir, f"{prefix}.{ext}")]
+
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+
+    wildcard = os.path.join(policy_dir, f"{prefix}_*.{ext}")
+    matches = sorted(glob.glob(wildcard), key=os.path.getmtime, reverse=True)
+    if matches:
+        print(
+            f"Warning: canonical {prefix}.{ext} not found in {policy_dir}; "
+            f"using latest {os.path.basename(matches[0])}"
+        )
+        return matches[0]
+
+    if required:
+        looked_for = ", ".join(os.path.basename(path) for path in candidates)
+        raise FileNotFoundError(
+            f"Could not find {prefix} snapshot in {policy_dir}. Tried: {looked_for}"
+        )
+    return candidates[0]
+
+
+def load_npz_to_vars(npz_path: str, variables) -> None:
+    data = np.load(npz_path)
+
+    file_keys = list(data.files)
+    count = min(len(file_keys), len(variables))
+    for idx in range(count):
+        arr = data[file_keys[idx]]
+        var = variables[idx]
+        if tuple(var.shape) != tuple(arr.shape):
+            print(
+                f"Skip raw-order shape mismatch at index {idx}: "
+                f"var={tuple(var.shape)} file={tuple(arr.shape)}"
+            )
+            continue
+        var.assign(arr)
+    print(f"Loaded {count} vars from {npz_path} by raw order")
 
 
 def apply_overrides(cfg, args):
@@ -52,16 +142,32 @@ def apply_overrides(cfg, args):
         cfg.max_train_steps = int(args.max_train_steps)
     if args.num_parallel_environments is not None:
         cfg.num_parallel_environments = int(args.num_parallel_environments)
-    if args.checkpoint_dir:
-        cfg.checkpoint_dir = args.checkpoint_dir
-    if args.policy_dir:
-        cfg.policy_dir = args.policy_dir
-    if args.log_dir:
-        cfg.log_dir = args.log_dir
+    cfg.ppo_entropy_regularization = float(ROBUST_ENTROPY_REGULARIZATION)
+
+
+def configure_output_dirs(cfg, args, project_root):
+    default_out_dir = os.path.join(project_root, "saved_policy", "em-max", "em-agent-lp-robust")
+    cfg.policy_dir = args.out_dir or default_out_dir
+    cfg.checkpoint_dir = args.checkpoint_dir or os.path.join(cfg.policy_dir, "checkpoints")
+    cfg.log_dir = args.log_dir or os.path.join(cfg.policy_dir, "logs", cfg.run_id)
+
+
+def load_initial_policy(agent, init_policy_dir: str):
+    actor_net = getattr(agent, "actor_net", getattr(agent, "_actor_net", None))
+    value_net = getattr(agent, "value_net", getattr(agent, "_value_net", None))
+
+    actor_path = resolve_snapshot_file(init_policy_dir, "actor", "npz", required=True)
+    value_path = resolve_snapshot_file(init_policy_dir, "value", "npz", required=False)
+
+    load_npz_to_vars(actor_path, actor_net.variables)
+    print(f"Loaded initial actor snapshot from {actor_path}")
+
+    if value_net is not None and os.path.exists(value_path):
+        load_npz_to_vars(value_path, value_net.variables)
+        print(f"Loaded initial value snapshot from {value_path}")
 
 
 def compute_avg_return(environment, policy, num_episodes=1, render=False, log_actions=False):
-    """Run evaluation episodes, optionally capturing the actions taken."""
     total_return = 0.0
     all_actions = []
     for _ in range(int(num_episodes)):
@@ -94,7 +200,6 @@ def compute_avg_return(environment, policy, num_episodes=1, render=False, log_ac
 
 
 def export_trainable_state(agent, cfg, tag="final"):
-    """Save actor/value/optimizer weights in a checkpoint-free format."""
     actor_net = getattr(agent, "actor_net", getattr(agent, "_actor_net", None))
     value_net = getattr(agent, "value_net", getattr(agent, "_value_net", None))
     optimizer = getattr(agent, "_optimizer", None) or getattr(agent, "optimizer", None)
@@ -142,9 +247,10 @@ def main(_):
 
     cfg = importlib.import_module(args.config_module)
     apply_overrides(cfg, args)
+
     project_root = os.path.dirname(os.path.abspath(__file__))
-    if not args.policy_dir:
-        cfg.policy_dir = os.path.join(project_root, "saved_policy", "em-max", "em-agent-lp")
+    configure_output_dirs(cfg, args, project_root)
+    init_policy_dir = resolve_init_policy_dir(args.policy_dir)
 
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     os.makedirs(cfg.log_dir, exist_ok=True)
@@ -153,14 +259,34 @@ def main(_):
 
     print(f"--- RUN ID: {cfg.run_id}")
     print(f"--- CONFIG: {args.config_module} | ALGO: {args.algo}")
+    print(f"--- INIT POLICY: {init_policy_dir}")
+    print(f"--- PERTURBATOR: {args.perturbator_path}")
+    print(f"--- REWARD MODEL: {args.reward_model_path} | SLICE INDEX: {args.reward_slice_index}")
+    print(f"--- INVERSE REWARD MODE: {args.inverse_reward_mode}")
+    print(f"--- ENTROPY REGULARIZATION: {cfg.ppo_entropy_regularization}")
 
     train_env = None
     eval_env = None
     try:
-        train_env = ran_env_wrapper.get_training_env(config_obj=cfg)
-        eval_env = ran_env_wrapper.get_eval_env(config_obj=cfg)
+        train_env = ran_env_robust_wrapper.get_training_env(
+            config_obj=cfg,
+            reward_model_path=args.reward_model_path,
+            perturbator_path=args.perturbator_path,
+            reward_slice_index=args.reward_slice_index,
+            reward_prb_max=args.reward_prb_max,
+            inverse_reward_mode=args.inverse_reward_mode,
+        )
+        eval_env = ran_env_robust_wrapper.get_eval_env(
+            config_obj=cfg,
+            reward_model_path=args.reward_model_path,
+            perturbator_path=args.perturbator_path,
+            reward_slice_index=args.reward_slice_index,
+            reward_prb_max=args.reward_prb_max,
+            inverse_reward_mode=args.inverse_reward_mode,
+        )
 
         agent = agent_builder.create_agent(train_env, algo=args.algo, config_obj=cfg)
+        load_initial_policy(agent, init_policy_dir)
 
         replay_buffer = tf_uniform_replay_buffer.TFUniformReplayBuffer(
             data_spec=agent.collect_data_spec,
@@ -187,9 +313,12 @@ def main(_):
         )
         if args.resume_from_checkpoint:
             train_checkpointer.initialize_or_restore()
-            print(f"Checkpoint restore enabled. Starting from step {int(agent.train_step_counter.numpy())}")
+            print(
+                f"Checkpoint restore enabled. Starting from step "
+                f"{int(agent.train_step_counter.numpy())}"
+            )
         else:
-            print("Fresh training run: checkpoint restore is disabled.")
+            print("Training from init policy snapshot; checkpoint restore is disabled.")
 
         train_summary_writer = tf.summary.create_file_writer(
             cfg.log_dir,
@@ -213,7 +342,6 @@ def main(_):
                     continue
 
             train_loss = agent.train(experience=trajectories)
-
             step = int(agent.train_step_counter.numpy())
 
             if step % int(cfg.log_interval) == 0:
@@ -231,7 +359,11 @@ def main(_):
                     print(f"Step {step}: actions_top{top_k}={', '.join(top_rows)}")
                 with train_summary_writer.as_default():
                     tf.summary.scalar("loss/total_loss", train_loss.loss, step=step)
-                    tf.summary.scalar("loss/entropy_loss", train_loss.extra.entropy_regularization_loss, step=step)
+                    tf.summary.scalar(
+                        "loss/entropy_loss",
+                        train_loss.extra.entropy_regularization_loss,
+                        step=step,
+                    )
 
             if step % int(cfg.eval_interval) == 0:
                 avg_return, eval_actions = compute_avg_return(

@@ -43,7 +43,9 @@ class RanEnv(gym.Env):
         self.use_mean_obs = use_mean_obs
         self.num_slices = 3
         self.columns_encoder = self.config.metric_list_autoencoder
-        
+
+        self.autoencoder_input_scale = getattr(self.config, "autoencoder_input_scale", 1.0)
+
         self.valid_actions = list(
             product(self.config.feasible_prb_allocation_all, self.config.scheduling_combos)
         )
@@ -80,12 +82,14 @@ class RanEnv(gym.Env):
             if key in self.data_cache[s_id]:
                 all_data = self.data_cache[s_id][key]
                 count = len(all_data)
-                
+
                 indices = np.random.choice(count, self.n_samples_per_slice, replace=(count < self.n_samples_per_slice))
                 data_chunk = all_data[indices]
-                
-                metrics_chunk = data_chunk[:, :self.num_metrics]
-                
+
+                metrics_chunk = data_chunk[:, :self.num_metrics].astype(np.float32)
+                if self.autoencoder_input_scale != 1.0:
+                    metrics_chunk = metrics_chunk * self.autoencoder_input_scale
+
                 total_reward += np.mean(data_chunk[:, -1])
                 prbs = float(np.mean(data_chunk[:, -3]))
                 sched = float(np.mean(data_chunk[:, -2]))

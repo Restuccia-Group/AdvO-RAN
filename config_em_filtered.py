@@ -23,6 +23,8 @@ metric_list_autoencoder = [
     "tx_pkts downlink",
 ]
 
+autoencoder_input_scale = 10.0
+
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 dataset_path = os.path.join(PROJECT_ROOT, "dataset", "embb_filtered.csv")
 encoder_path = os.path.join(PROJECT_ROOT, "encoder.h5")
@@ -35,7 +37,7 @@ ppo_actor_fc_layers = (30, 30, 30, 30, 30)
 ppo_value_fc_layers = (30, 30, 30, 30, 30)
 ppo_learning_rate = 1e-4
 ppo_num_epochs = 10
-ppo_entropy_regularization = 0.02
+ppo_entropy_regularization = 0.05
 ppo_importance_ratio_clipping = 0.2
 ppo_normalize_observations = True
 ppo_normalize_rewards = True
@@ -43,9 +45,9 @@ ppo_use_gae = True
 greedy_eval = False
 
 run_id = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-drl_save_folder = os.path.join(PROJECT_ROOT, "train_runs", "em-max-filtered")
+drl_save_folder = os.path.join(PROJECT_ROOT, "saved_policy", "em-max", "em-agent-lp")
 checkpoint_dir = os.path.join(drl_save_folder, "checkpoints")
-policy_dir = os.path.join(drl_save_folder, "policy")
+policy_dir = drl_save_folder
 log_dir = os.path.join(drl_save_folder, "logs", run_id)
 
 max_train_steps = 2000

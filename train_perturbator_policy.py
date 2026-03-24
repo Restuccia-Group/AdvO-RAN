@@ -2,7 +2,6 @@
 
 import argparse
 import glob
-import json
 import os
  
 import numpy as np
@@ -14,6 +13,7 @@ import config_em_filtered as cfg
  
  
 DEFAULT_POLICY_DIR_CANDIDATES = [
+    os.path.join(os.path.dirname(__file__), "saved_policy", "em-max", "em-agent-lp"),
     os.path.join(os.path.dirname(__file__), "saved_policy", "em-max", "em-agent-filtered"),
     os.path.join(os.path.dirname(__file__), "saved_policy", "em-agent-filtered"),
     os.path.join(os.path.dirname(__file__), "saved_policy", "em-agent"),
@@ -53,59 +53,8 @@ def _resolve_snapshot_file(policy_dir, prefix, ext, required=True):
     return candidates[0]
 
 
-def read_json_if_exists(path):
-    if not path or not os.path.exists(path):
-        return None
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception as exc:
-        print(f"Warning: could not read metadata {path}: {exc}")
-        return None
-
-
-def find_variable_map(meta, target="actor"):
-    if meta is None:
-        return None
-    candidate_keys = [
-        f"{target}_variable_map",
-        f"{target}_var_map",
-        f"{target}_map",
-        f"{target}_vars",
-    ]
-    for key in candidate_keys:
-        if key in meta and isinstance(meta[key], list):
-            return meta[key]
-    for value in meta.values():
-        if isinstance(value, dict):
-            for key in candidate_keys:
-                if key in value and isinstance(value[key], list):
-                    return value[key]
-    return None
-
-
-def load_npz_to_vars(npz_path, variables, variable_map=None):
+def load_npz_to_vars(npz_path, variables):
     data = np.load(npz_path)
-    if variable_map:
-        name_to_var = {v.name: v for v in variables}
-        loaded = 0
-        for item in variable_map:
-            saved_key = item.get("saved_key")
-            var_name = item.get("var_name")
-            if saved_key not in data or var_name not in name_to_var:
-                continue
-            arr = data[saved_key]
-            var = name_to_var[var_name]
-            if tuple(var.shape) != tuple(arr.shape):
-                print(f"Skip shape mismatch {var_name}: var={tuple(var.shape)} file={tuple(arr.shape)}")
-                continue
-            var.assign(arr)
-            loaded += 1
-        if loaded > 0:
-            print(f"Loaded {loaded}/{len(variables)} vars from {npz_path} via metadata map")
-            return
-        print("Metadata map matched no variables; falling back to raw order.")
-
     file_keys = list(data.files)
     count = min(len(file_keys), len(variables))
     for i in range(count):
@@ -124,21 +73,17 @@ def load_snapshot(policy_dir=None):
         _resolve_snapshot_file(policy_dir, "actor", "npz", required=True),
         _resolve_snapshot_file(policy_dir, "value", "npz", required=True),
         _resolve_snapshot_file(policy_dir, "optimizer", "npz", required=False),
-        _resolve_snapshot_file(policy_dir, "metadata", "json", required=False),
     )
  
  
 def load_actor(eval_env, policy_dir, label="actor"):
     agent = agent_builder.create_agent(eval_env, algo="ppo", config_obj=cfg)
-    actor_path, value_path, _, meta_path = load_snapshot(policy_dir)
-    meta = read_json_if_exists(meta_path)
+    actor_path, value_path, _ = load_snapshot(policy_dir)
     actor_net = getattr(agent, "actor_net", getattr(agent, "_actor_net"))
     value_net = getattr(agent, "value_net", getattr(agent, "_value_net"))
-    load_npz_to_vars(actor_path, actor_net.variables, find_variable_map(meta, target="actor"))
-    load_npz_to_vars(value_path, value_net.variables, find_variable_map(meta, target="value"))
+    load_npz_to_vars(actor_path, actor_net.variables)
+    load_npz_to_vars(value_path, value_net.variables)
     print(f"Loaded {label} from {os.path.dirname(actor_path)}")
-    if meta is not None:
-        print(f"  metadata ({meta_path}): {meta}")
     return agent, actor_net
  
  
@@ -364,102 +309,86 @@ def run_step(time_step, obs, perturb_net, victim_agent, ref_actor,
     else:
         adv_obs = obs
         linf    = 0.0
- 
+
     attacked_ts = time_step._replace(observation=adv_obs)
     action_step = victim_agent.policy.action(attacked_ts)
     victim_id   = int(action_step.action.numpy().flatten()[0])
- 
-    b            = tf.shape(obs)[0]
-    step_type    = tf.convert_to_tensor(time_step.step_type, dtype=tf.int32)
-    init_state_r = ref_actor.get_initial_state(batch_size=b)
-    dist_r, _    = ref_actor(obs, step_type, init_state_r, training=False)
-    ref_id       = int(tf.argmax(get_probs(dist_r), axis=-1).numpy().flatten()[0])
- 
+
     reward = float(time_step.reward)
-    match  = "match" if victim_id == ref_id else "miss"
     prb_alloc, sched = decode_action(victim_id)
     print(
-        f"[{phase} t={step_idx}] victim={victim_id} ref={ref_id} [{match}] "
+        f"[{phase} t={step_idx}] victim={victim_id} "
         f"prb={prb_alloc} sched={sched} reward={reward:.4f} L_inf={linf:.4f}"
     )
-    return action_step, victim_id, ref_id, reward
- 
- 
+    return action_step, victim_id, reward
+
+
 def evaluate(eval_env, victim_agent, victim_actor, ref_actor, perturb_net, horizon):
     def run_phase(phase, is_attack):
         time_step = eval_env.reset()
-        rewards, matches, total = [], 0, 0
+        rewards = []
         for t in range(horizon):
             obs = tf.convert_to_tensor(time_step.observation, dtype=tf.float32)
-            action_step, victim_id, ref_id, reward = run_step(
+            action_step, victim_id, reward = run_step(
                 time_step, obs, perturb_net, victim_agent, ref_actor,
                 is_attack=is_attack, step_idx=t, phase=phase,
             )
             rewards.append(reward)
-            matches += int(victim_id == ref_id)
-            total   += 1
             time_step = eval_env.step(action_step.action)
             if time_step.is_last():
                 time_step = eval_env.reset()
-        return sum(rewards), matches, total
- 
+        return sum(rewards)
+
     print("\n" + "=" * 64)
-    print("Phase 1 — Baseline (clean victim, fresh env)")
+    print("Phase 1 — Baseline")
     print("=" * 64)
-    base_r, base_m, base_t = run_phase("baseline", is_attack=False)
- 
+    base_r = run_phase("baseline", is_attack=False)
+
     print("\n" + "=" * 64)
-    print("Phase 2 — Attack (perturbed victim, fresh env)")
+    print("Phase 2 — Attack")
     print("=" * 64)
-    atk_r, atk_m, atk_t = run_phase("attack", is_attack=True)
- 
-    print("\n" + "=" * 64)
-    print("Phase 3 — Recovery (clean victim, fresh env)")
-    print("=" * 64)
-    rec_r, rec_m, rec_t = run_phase("recovery", is_attack=False)
- 
+    atk_r = run_phase("attack", is_attack=True)
+
     safe = base_r if abs(base_r) > 1e-8 else 1e-8
     print("\n" + "=" * 64)
     print("Summary")
     print("=" * 64)
-    print(f"  Baseline  reward : {base_r:>10.4f}  | ref-match {base_m}/{base_t} ({100*base_m/base_t:.1f}%)")
-    print(f"  Attack    reward : {atk_r:>10.4f}  | ref-match {atk_m}/{atk_t} ({100*atk_m/atk_t:.1f}%)  "
-          f"| reward delta {100*(base_r-atk_r)/abs(safe):+.1f}%")
-    print(f"  Recovery  reward : {rec_r:>10.4f}  | ref-match {rec_m}/{rec_t} ({100*rec_m/rec_t:.1f}%)")
-    print("=" * 64)
-    print(f"  Attack effectiveness (ref-match lift): "
-          f"{atk_m/atk_t:.3f} - {base_m/base_t:.3f} = {(atk_m/atk_t)-(base_m/base_t):+.3f}")
-    print("  Recovery ref-match ~= Baseline ref-match => victim undamaged.")
+    print(f"  Baseline  reward : {base_r:>10.4f}")
+    print(f"  Attack    reward : {atk_r:>10.4f}  | "
+          f"reward delta {100*(base_r-atk_r)/abs(safe):+.1f}%")
  
  
 def main():
     parser = argparse.ArgumentParser(
-        description="Amortized adversarial attack — direct eq 11 loss (AdvO-RAN)"
+        description=""
     )
     parser.add_argument("--policy_dir",       default=None)
-    parser.add_argument("--ref_policy_dir",   default=None)
+    parser.add_argument(
+        "--ref_policy_dir",
+        default="saved_policy/em-max/em-adversarial-agent",
+    )
     parser.add_argument("--reward_model",     default="reward_model.h5",
                         help="Path to reward_model.h5. "
                              "Input: normalised [prb, sched] shape (B, 2). "
                              "Output: scalar reward estimate shape (B, 1).")
-    parser.add_argument("--eps",              type=float, default=0.3)
+    parser.add_argument("--eps",              type=float, default=3.0)
     parser.add_argument("--p_norm",           type=float, default=float("inf"),
                         help="p for L_p norm in L_pen (eq 9). 2=L2, inf=L_inf.")
     parser.add_argument("--lam",              type=float, default=1.0,
-                        help="lambda: L_pen weight (eq 9)")
-    parser.add_argument("--beta",             type=float, default=0.2,
-                        help="beta: L_KL weight (eq 10)")
-    parser.add_argument("--gamma_w",          type=float, default=1.0,
-                        help="gamma_w: J weight (eq 8). 0 = disable J.")
+                        help="lambda: L_pen weight")
+    parser.add_argument("--beta",             type=float, default=2.0,
+                        help="beta: L_KL weight ")
+    parser.add_argument("--gamma_w",          type=float, default=10.0,
+                        help="gamma_w: J weight . 0 = disable J.")
     parser.add_argument("--collect_steps",    type=int,   default=1000)
     parser.add_argument("--epochs",           type=int,   default=100)
     parser.add_argument("--batch_size",       type=int,   default=64)
-    parser.add_argument("--lr",               type=float, default=1e-3)
+    parser.add_argument("--lr",               type=float, default=1e-4)
     parser.add_argument("--hidden",           type=int,   nargs="+", default=[256, 256])
     parser.add_argument("--horizon",          type=int,   default=10)
     parser.add_argument("--no_attack",        action="store_true")
-    parser.add_argument("--save_perturb_net", default="perturbator.keras",
-                        help="Path to save the perturbation network (Keras format)")
+    parser.add_argument("--save_perturb_net", default="pert.h5",
+                        help="Path to save the perturbation network")
     args = parser.parse_args()
  
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
@@ -488,7 +417,6 @@ def main():
         f"victim_dir={resolve_policy_dir(args.policy_dir)}  "
         f"reference_dir={resolve_policy_dir(args.ref_policy_dir or args.policy_dir)}"
     )
-    print(f"Loss: L = J(eq8, r_hat) + L_pen(eq9) + L_KL(eq10)  [direct, no PGD]\n")
  
     if args.no_attack:
         evaluate(eval_env, victim_agent, victim_actor, ref_actor,

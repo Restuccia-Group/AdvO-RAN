@@ -7,11 +7,13 @@ import pandas as pd
 import tensorflow as tf
 from tensorflow import keras
 
+# ─────────────────────────── SCHEDULING MAPS ──────────────────────────────────
 SCHED_INT_TO_NAME = {0: "RR", 1: "PF", 2: "WF"}
 SCHED_STR_TO_INT  = {"RR": 0, "PF": 1, "WF": 2}
 N_SCHED           = 3
 
-MAX_KBPS        = 4000.0   # 4 Mbps = 4000 Kbps
+# ─────────────────────────── HYPERPARAMETERS ──────────────────────────────────
+MAX_KBPS        = 4000000.0   # 4 Mbps
 SLA_THRESHOLD   = 0.70     # violation if dl_bitrate_norm < 0.70
 ROWS_PER_STATE  = 10       # rows sampled per time-step
 STATES_PER_TRAJ = 10       # d states per trajectory
@@ -20,7 +22,7 @@ BATCH_SIZE      = 64
 LR              = 1e-3
 EPOCHS          = 50
 HIDDEN_DIM      = 64
-VAL_SPLIT       = 0.10
+VAL_SPLIT       = 0.20
 SEED            = 42
 STATE_DIM       = 2        # [prb_norm, sched_norm]
 
@@ -28,8 +30,12 @@ random.seed(SEED)
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
 
-MAX_PRB = None   # set after loading data
+MAX_PRB = 50 #15  
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
 
 def normalise_sched(series):
     """Accept int {0,1,2} OR string {"RR","PF","WF"} -> int Series."""
@@ -39,30 +45,41 @@ def normalise_sched(series):
     return series.astype(int)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 1 │ LOAD & PRE-PROCESS
+# ══════════════════════════════════════════════════════════════════════════════
+
 def load_and_preprocess(csv_path):
     global MAX_PRB
 
     df = pd.read_csv(csv_path)
 
+    # Validate columns
     required = {"dl_brate", "slice_prb", "sched_alg"}
     missing  = required - set(df.columns)
     if missing:
         raise ValueError(f"Missing columns: {missing}\nFound: {list(df.columns)}")
 
+    # Scheduling -> int {0,1,2}
     df["sched_int"] = normalise_sched(df["sched_alg"])
     if df["sched_int"].isna().any():
         bad = df["sched_alg"][df["sched_int"].isna()].unique()
         raise ValueError(f"Unrecognised sched_alg values: {bad}")
     df["sched_name"] = df["sched_int"].map(SCHED_INT_TO_NAME)
 
+    # Derive MAX_PRB from data
     MAX_PRB = float(df["slice_prb"].max())
 
+    # Normalise bitrate (Kbps -> [0,1])
     df["dl_bitrate_norm"] = (df["dl_brate"].astype(float) / MAX_KBPS).clip(0.0, 1.0)
 
+    # Static SLA violation label (used ONLY for labelling, NOT model input)
     df["sla_violation"] = (df["dl_bitrate_norm"] < SLA_THRESHOLD).astype(float)
 
+    # Action key
     df["action_key"] = df["slice_prb"].astype(str) + "_" + df["sched_name"]
 
+    # Diagnostics
     print(f"\n{'='*60}")
     print(f"  CSV        : {csv_path}")
     print(f"  Rows       : {len(df):,}")
@@ -86,6 +103,10 @@ def load_and_preprocess(csv_path):
     return df
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 2 │ ACTION FEATURE EXTRACTION
+# ══════════════════════════════════════════════════════════════════════════════
+
 def extract_action_features(rows):
     """
     [prb_norm, sched_norm]  shape: (2,)
@@ -96,6 +117,10 @@ def extract_action_features(rows):
         float(rows["sched_int"].iloc[0]) / (N_SCHED - 1),
     ], dtype=np.float32)
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 3 │ TRAJECTORY SAMPLING
+# ══════════════════════════════════════════════════════════════════════════════
 
 def sample_trajectory(df):
 
@@ -110,6 +135,7 @@ def sample_trajectory(df):
         rows = adf.sample(ROWS_PER_STATE, replace=replace)
         flags.append(1.0 if rows["sla_violation"].mean() > 0 else 0.0)
 
+    # Same action repeated T times -> (T, 2)
     states = np.tile(action_feat, (STATES_PER_TRAJ, 1)).astype(np.float32)
 
     return {
@@ -123,6 +149,10 @@ def compute_v_sla(traj):
     """V_sla(sigma) = mean(I_sigma(t))   [Eq. 2]"""
     return float(traj["step_viol_flags"].mean())
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 4 │ PREFERENCE DATASET
+# ══════════════════════════════════════════════════════════════════════════════
 
 def build_preference_dataset(df, n_pairs=N_PAIRS):
     """
@@ -165,6 +195,10 @@ def build_preference_dataset(df, n_pairs=N_PAIRS):
     )
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 5 │ REWARD MODEL  (Keras)
+# ══════════════════════════════════════════════════════════════════════════════
+
 def build_reward_model(state_dim=STATE_DIM, hidden_dim=HIDDEN_DIM):
     """
     Simple MLP: [prb_norm, sched_norm] -> scalar reward
@@ -186,6 +220,10 @@ def build_reward_model(state_dim=STATE_DIM, hidden_dim=HIDDEN_DIM):
     return model
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 6 │ BRADLEY-TERRY LOSS  (custom Keras loss)
+# ══════════════════════════════════════════════════════════════════════════════
+
 class BradleyTerryLoss(keras.losses.Loss):
     """
     L(psi) = -E[ sum_{i in {x,z}} y^(i) * log P_psi[sigma_i > sigma_{-i}] ]
@@ -200,6 +238,10 @@ class BradleyTerryLoss(keras.losses.Loss):
         return tf.reduce_mean(loss)
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 7 │ TRAINING  (custom loop - needed for paired trajectory input)
+# ══════════════════════════════════════════════════════════════════════════════
+
 def train_reward_model(sx_all, sz_all, y_all,
                        epochs=EPOCHS, batch_sz=BATCH_SIZE, lr=LR):
     """
@@ -209,6 +251,7 @@ def train_reward_model(sx_all, sz_all, y_all,
 
     Custom training loop because the loss needs both trajectories simultaneously.
     """
+    # Train / val split
     n       = len(y_all)
     n_val   = max(1, int(n * VAL_SPLIT))
     idx     = np.random.permutation(n)
@@ -234,9 +277,11 @@ def train_reward_model(sx_all, sz_all, y_all,
 
     for epoch in range(1, epochs + 1):
 
+        # ── Shuffle training data each epoch ──────────────────────────────────
         perm = np.random.permutation(n_tr)
         sx_tr, sz_tr, y_tr = sx_tr[perm], sz_tr[perm], y_tr[perm]
 
+        # ── Training batches ──────────────────────────────────────────────────
         t_loss_sum = 0.0
         for step in range(steps):
             sl  = slice(step * batch_sz, (step + 1) * batch_sz)
@@ -245,6 +290,8 @@ def train_reward_model(sx_all, sz_all, y_all,
             by  = tf.constant(y_tr[sl])    # (B, 2)
 
             with tf.GradientTape() as tape:
+                # Cumulative reward per trajectory: sum over T steps
+                # model input: (B*T, 2)  -> output (B*T, 1) -> reshape (B, T) -> sum -> (B,)
                 B = tf.shape(bsx)[0]
                 R_x = tf.reduce_sum(
                     tf.reshape(model(tf.reshape(bsx, (-1, STATE_DIM))), (B, STATES_PER_TRAJ)),
@@ -264,6 +311,7 @@ def train_reward_model(sx_all, sz_all, y_all,
 
         t_loss = t_loss_sum / steps
 
+        # ── Validation ────────────────────────────────────────────────────────
         bsx = tf.constant(sx_vl)
         bsz = tf.constant(sz_vl)
         by  = tf.constant(y_vl)
@@ -292,6 +340,10 @@ def train_reward_model(sx_all, sz_all, y_all,
     return model
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 8 │ PER-ACTION REWARD TABLE
+# ══════════════════════════════════════════════════════════════════════════════
+
 def scalar_reward(model, prb, sched_int):
     """r_hat for a single (prb, sched) action."""
     feat = np.array([[
@@ -319,6 +371,10 @@ def evaluate_per_action_rewards(model, df):
               f"{sub['sla_violation'].mean():>10.2%}  {r:>8.4f}")
     print()
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ══════════════════════════════════════════════════════════════════════════════
 
 def parse_args():
     p = argparse.ArgumentParser(description="AdvO-RAN EM-agent Reward Model (Keras)")

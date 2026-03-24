@@ -2,99 +2,255 @@
 
 Adversarial and robust PPO workflows for ORAN scheduling.
 
-## What is in this folder
-- `train_modular.py`: train base PPO policy and export actor/value/optimizer snapshots.
-- `attack_wa.py`: run PGD-based white-box attack evaluation.
-- `train_perturbator_policy.py`: train learned perturbation model (`pert.h5`).
-- `radial.py`: RADIAL-PPO robust training.
-- `sa-ppo.py`: robust PPO training that uses a learned perturbator model.
-- `saved_policy/em-max/em-agent-filtered`: current default policy snapshot directory.
+This repo now uses `saved_policy/em-max/em-agent-lp` as the default victim policy.
 
-## Prerequisites
-- Python 3.10+
-- Install deps:
+## Folder Layout
 
-```bash
-pip install -r requirements.txt
+The repo stays intentionally flat because the entry-point scripts import sibling modules by name. Moving the Python files into subfolders would add churn without improving execution. Runtime assets are organized in folders instead:
+
+| Path | Purpose |
+| --- | --- |
+| `dataset/` | Input CSV files used by the environment and reward-model training |
+| `saved_policy/em-max/em-agent-lp/` | Victim PPO policy snapshots (`actor.npz`, `value.npz`, `optimizer.npz`) |
+| `saved_policy/em-max/em-adversarial-agent/` | Reference adversarial policy used by the perturbator workflow |
+| `saved_policy/em-max/em-agent-lp-robust/` | Default output folder for robust PPO training |
+| `requirements/` | Dependency manifests (`current.txt` and `legacy-tf23.txt`) |
+| `utils/` | Small helper scripts such as `run_actor_npz.py` |
+
+`saved_policy/em-max/em-agent-radial/` is an older artifact directory from the previous RADIAL workflow. The active robust training entry point is now `train_robust_policy.py`.
+
+## Active Scripts
+
+| Script | Role |
+| --- | --- |
+| `train_modular.py` | Train or refresh the victim PPO policy |
+| `reward_model.py` | Train `reward_model.h5` from a CSV file |
+| `training_adversarial_policy.py` | Train the adversarial/reference PPO policy using `reward_model.h5` |
+| `train_perturbator_policy.py` | Train the observation perturbator and save `pert.h5` |
+| `train_robust_policy.py` | Train the robust PPO policy starting from `em-agent-lp` |
+| `attack_wa.py` | Run a PGD-style attack against the victim actor |
+| `evaluate_action_net.py` | Inspect the victim actor/action net behavior |
+| `evaluate_perturbator_effect.py` | Measure how `pert.h5` changes the victim policy |
+| `utils/run_actor_npz.py` | Step through a saved `actor.npz` snapshot in the environment |
+
+## Dependencies
+
+Two dependency tracks are kept on purpose:
+
+- `requirements/current.txt`: current loose stack for the newer code path
+- `requirements/legacy-tf23.txt`: reproducible legacy stack for the TensorFlow 2.3 experiments and saved checkpoints
+
+### Important Compatibility Note
+
+The exact package set below is **not** installable as written:
+
+```text
+cloudpickle==1.4.1
+numpy<1.19.0
+pandas
+scipy==1.4.1
+setuptools>=41.0.0
+tensorflow==2.3
+tensorflow-probability==0.7
+tf_agents
 ```
 
-### Important path note
-`agent_builder.py` is in the parent directory (`../agent_builder.py`), so run commands with:
+Use `requirements/legacy-tf23.txt` instead. The corrected legacy stack is:
+
+- Python `3.8.x`
+- `tensorflow==2.3.0`
+- `tensorflow-probability==0.11.0`
+- `tf-agents==0.6.0`
+
+The repo already includes this corrected stack in `requirements/legacy-tf23.txt`.
+
+## Step-By-Step Run Procedure
+
+Run every command below from the repo root.
+No extra `PYTHONPATH` setup is required.
+
+### 1. Create the environment
+
+For the legacy TensorFlow 2.3 workflow:
 
 ```bash
-PYTHONPATH=..
+python3.8 -m venv .venv-tf23
+source .venv-tf23/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements/legacy-tf23.txt
 ```
 
-## Quick sanity checks
+If you want the current loose stack instead:
+
 ```bash
-PYTHONPATH=.. python train_modular.py --help
-PYTHONPATH=.. python attack_wa.py --help
-PYTHONPATH=.. python train_perturbator_policy.py --help
-PYTHONPATH=.. python radial.py --help
-PYTHONPATH=.. python sa-ppo.py --help
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
-## Run commands
+### 2. Verify the required local assets
 
-### 1) Train base policy
+Make sure these files exist before running training or evaluation:
+
 ```bash
-PYTHONPATH=.. python train_modular.py \
-  --config_module config_em_filtered \
-  --cpu_only
+ls dataset/embb_filtered.csv
+ls dataset/colosseum_oran_coloran_ue2_003.csv
+ls encoder.h5
+ls saved_policy/em-max/em-agent-lp/actor.npz
+ls saved_policy/em-max/em-agent-lp/value.npz
+ls reward_model.h5
+ls pert.h5
 ```
 
-Optional fast smoke run:
+Notes:
+
+- `dataset/embb_filtered.csv` is the environment dataset used by `config_em_filtered.py`
+- `dataset/colosseum_oran_coloran_ue2_003.csv` is the CSV used to rebuild the reward model
+- `saved_policy/em-max/em-agent-lp/` is the default victim policy directory
+
+### 3. Sanity-check the victim agent
+
+Run the saved victim actor directly:
+
 ```bash
-PYTHONPATH=.. python train_modular.py \
-  --config_module config_em_filtered \
-  --max_train_steps 10 \
-  --cpu_only
+python utils/run_actor_npz.py \
+  saved_policy/em-max/em-agent-lp/actor.npz \
+  --steps 10 \
+  --action_mode greedy
 ```
 
-### 2) Evaluate / attack policy
-Baseline only (no perturbation):
+Inspect the action net in more detail:
+
 ```bash
-PYTHONPATH=.. python attack_wa.py \
-  --horizon 10 \
-  --no_attack
+python evaluate_action_net.py \
+  saved_policy/em-max/em-agent-lp \
+  --collect_steps 200 \
+  --eval_episodes 5 \
+  --eval_max_steps 10
 ```
 
-PGD attack enabled:
+### 4. Run attacks and perturbation evaluation
+
+Worst action attack against the victim policy:
+
 ```bash
-PYTHONPATH=.. python attack_wa.py \
+python attack_wa.py \
+  --policy_dir saved_policy/em-max/em-agent-lp \
   --eps 0.3 \
   --alpha 0.015 \
   --iters 20 \
   --horizon 10
 ```
 
-### 3) Train perturbator (`pert.h5`)
+Evaluate the learned perturbator on the victim policy:
+
 ```bash
-PYTHONPATH=.. python train_perturbator_policy.py \
+python evaluate_perturbator_effect.py \
+  --policy_dir saved_policy/em-max/em-agent-lp \
+  --perturbator_path pert.h5 \
+  --collect_steps 200 \
+  --eval_episodes 5 \
+  --eval_max_steps 10
+```
+
+### 5. 
+
+#### 5.1 Train or refresh the victim policy
+
+This writes canonical snapshots into `saved_policy/em-max/em-agent-lp/`.
+
+```bash
+python train_modular.py --cpu_only
+```
+
+#### 5.2 Train the reward model
+
+```bash
+python reward_model.py \
+  --csv dataset/colosseum_oran_coloran_ue2_003.csv \
+  --out_model reward_model.h5
+```
+
+#### 5.3 Train the adversarial/reference policy
+
+This writes to `saved_policy/em-max/em-adversarial-agent/`.
+
+```bash
+python training_adversarial_policy.py \
+  --reward_model_path reward_model.h5 \
+  --cpu_only
+```
+
+#### 5.4 Train the perturbator
+
+Victim policy = `em-agent-lp`, reference policy = `em-adversarial-agent`.
+
+```bash
+python train_perturbator_policy.py \
+  --policy_dir saved_policy/em-max/em-agent-lp \
+  --ref_policy_dir saved_policy/em-max/em-adversarial-agent \
   --reward_model reward_model.h5 \
-  --collect_steps 1000 \
-  --epochs 100 \
   --save_perturb_net pert.h5
 ```
 
-### 4) Run RADIAL-PPO robust training
-```bash
-PYTHONPATH=.. python radial.py \
-  --policy_dir saved_policy/em-max/em-agent-filtered \
-  --out_dir saved_policy/em-max/em-agent-radial
-```
+#### 5.5 Train the robust policy
 
-### 5) Run SA-PPO with learned perturbator
+This starts from `saved_policy/em-max/em-agent-lp/` and writes to `saved_policy/em-max/em-agent-lp-robust/`.
+
 ```bash
-PYTHONPATH=.. python sa-ppo.py \
+python train_robust_policy.py \
+  --policy_dir saved_policy/em-max/em-agent-lp \
   --perturbator_path pert.h5 \
-  --policy_dir saved_policy/em-max/em-agent-filtered \
-  --out_dir saved_policy/em-max/em-agent-radial
+  --reward_model_path reward_model.h5 \
+  --cpu_only
 ```
 
-## Outputs
-- Base policy snapshots: `actor.npz`, `value.npz`, `optimizer.npz`, `metadata.json` under `saved_policy/em-max/em-agent-filtered`
-- Robust outputs: `actor.npz`, `actor_best.npz`, `train_logs.npz`, `metadata.json` under `saved_policy/em-max/em-agent-radial`
-- Perturbator model: `pert.h5` (or your custom `--save_perturb_net` path)
+### 6. Evaluate the final outputs
 
+Evaluate the original victim again:
 
+```bash
+python evaluate_action_net.py saved_policy/em-max/em-agent-lp
+```
+
+Evaluate the robust policy:
+
+```bash
+python evaluate_action_net.py saved_policy/em-max/em-agent-lp-robust
+```
+
+Compare the perturbator effect on the victim:
+
+```bash
+python evaluate_perturbator_effect.py \
+  --policy_dir saved_policy/em-max/em-agent-lp \
+  --perturbator_path pert.h5
+```
+
+## Output Summary
+
+| Output | Default location |
+| --- | --- |
+| Victim PPO snapshots | `saved_policy/em-max/em-agent-lp/` |
+| Adversarial/reference PPO snapshots | `saved_policy/em-max/em-adversarial-agent/` |
+| Robust PPO snapshots | `saved_policy/em-max/em-agent-lp-robust/` |
+| Reward model | `reward_model.h5` |
+| Perturbator | `pert.h5` |
+
+## Short Workflow Guide
+
+If you already trust the bundled victim policy and only want to run the attack pipeline, use this order:
+
+1. Create the Python 3.8 environment with `requirements/legacy-tf23.txt`
+2. Run `utils/run_actor_npz.py` or `evaluate_action_net.py` on `saved_policy/em-max/em-agent-lp`
+3. Run `attack_wa.py`
+4. Run `evaluate_perturbator_effect.py`
+
+If you want to rebuild everything from scratch, use this order:
+
+1. `train_modular.py`
+2. `reward_model.py`
+3. `training_adversarial_policy.py`
+4. `train_perturbator_policy.py`
+5. `train_robust_policy.py`

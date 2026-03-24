@@ -1,50 +1,64 @@
 #!/usr/bin/env python3
 
-
 import argparse
+import gc
 import importlib
 import os
-import gc
 
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
 os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
 
-import tensorflow as tf
 import numpy as np
+import tensorflow as tf
 from tf_agents.drivers import dynamic_step_driver
 from tf_agents.replay_buffers import tf_uniform_replay_buffer
 from tf_agents.system import system_multiprocessing as multiprocessing
 from tf_agents.utils import common
 
 import agent_builder
-import ran_env_wrapper
+import ran_env_adversarial_wrapper
+
+ADVERSARIAL_ENTROPY_REGULARIZATION = 0.1
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Modular DRL training launcher")
-    p.add_argument("--config_module", default="config_em_filtered", help="Config module, e.g. config_em_filtered")
-    p.add_argument("--algo", default="ppo", choices=["ppo"], help="DRL algorithm")
-
-    p.add_argument("--max_train_steps", type=int, default=None)
-    p.add_argument("--num_parallel_environments", type=int, default=None)
-    p.add_argument("--checkpoint_dir", default=None)
-    p.add_argument("--policy_dir", default=None)
-    p.add_argument("--log_dir", default=None)
-    p.add_argument(
+    parser = argparse.ArgumentParser(
+        description="Train an adversarial PPO policy using reward_model.h5 as the environment reward."
+    )
+    parser.add_argument("--config_module", default="config_em_filtered", help="Config module")
+    parser.add_argument("--algo", default="ppo", choices=["ppo"], help="DRL algorithm")
+    parser.add_argument("--reward_model_path", default="reward_model.h5", help="Path to reward model")
+    parser.add_argument(
+        "--reward_slice_index",
+        type=int,
+        default=0,
+        help="Slice index whose [prb, sched] pair is scored by the reward model",
+    )
+    parser.add_argument(
+        "--reward_prb_max",
+        type=float,
+        default=None,
+        help="Optional PRB max used to normalize reward-model inputs",
+    )
+    parser.add_argument("--max_train_steps", type=int, default=None)
+    parser.add_argument("--num_parallel_environments", type=int, default=None)
+    parser.add_argument("--checkpoint_dir", default=None)
+    parser.add_argument("--policy_dir", default=None)
+    parser.add_argument("--log_dir", default=None)
+    parser.add_argument(
         "--resume_from_checkpoint",
         action="store_true",
-        help="Restore from latest checkpoint in checkpoint_dir before training",
+        help="Restore from the latest checkpoint before training",
     )
-    p.add_argument(
+    parser.add_argument(
         "--action_print_top_k",
         type=int,
         default=8,
         help="Top-K most frequent actions to print at each log interval",
     )
-
-    p.add_argument("--cpu_only", action="store_true", help="Force CPU-only at runtime")
-    p.add_argument("--render_eval", action="store_true", help="Render eval environment each step")
-    return p.parse_args()
+    parser.add_argument("--cpu_only", action="store_true", help="Force CPU-only at runtime")
+    parser.add_argument("--render_eval", action="store_true", help="Render eval environment each step")
+    return parser.parse_args()
 
 
 def apply_overrides(cfg, args):
@@ -52,16 +66,17 @@ def apply_overrides(cfg, args):
         cfg.max_train_steps = int(args.max_train_steps)
     if args.num_parallel_environments is not None:
         cfg.num_parallel_environments = int(args.num_parallel_environments)
-    if args.checkpoint_dir:
-        cfg.checkpoint_dir = args.checkpoint_dir
-    if args.policy_dir:
-        cfg.policy_dir = args.policy_dir
-    if args.log_dir:
-        cfg.log_dir = args.log_dir
+    cfg.ppo_entropy_regularization = float(ADVERSARIAL_ENTROPY_REGULARIZATION)
+
+
+def configure_output_dirs(cfg, args, project_root):
+    default_policy_dir = os.path.join(project_root, "saved_policy", "em-max", "em-adversarial-agent")
+    cfg.policy_dir = args.policy_dir or default_policy_dir
+    cfg.checkpoint_dir = args.checkpoint_dir or os.path.join(cfg.policy_dir, "checkpoints")
+    cfg.log_dir = args.log_dir or os.path.join(cfg.policy_dir, "logs", cfg.run_id)
 
 
 def compute_avg_return(environment, policy, num_episodes=1, render=False, log_actions=False):
-    """Run evaluation episodes, optionally capturing the actions taken."""
     total_return = 0.0
     all_actions = []
     for _ in range(int(num_episodes)):
@@ -94,7 +109,6 @@ def compute_avg_return(environment, policy, num_episodes=1, render=False, log_ac
 
 
 def export_trainable_state(agent, cfg, tag="final"):
-    """Save actor/value/optimizer weights in a checkpoint-free format."""
     actor_net = getattr(agent, "actor_net", getattr(agent, "_actor_net", None))
     value_net = getattr(agent, "value_net", getattr(agent, "_value_net", None))
     optimizer = getattr(agent, "_optimizer", None) or getattr(agent, "optimizer", None)
@@ -142,9 +156,9 @@ def main(_):
 
     cfg = importlib.import_module(args.config_module)
     apply_overrides(cfg, args)
+
     project_root = os.path.dirname(os.path.abspath(__file__))
-    if not args.policy_dir:
-        cfg.policy_dir = os.path.join(project_root, "saved_policy", "em-max", "em-agent-lp")
+    configure_output_dirs(cfg, args, project_root)
 
     os.makedirs(cfg.checkpoint_dir, exist_ok=True)
     os.makedirs(cfg.log_dir, exist_ok=True)
@@ -153,12 +167,24 @@ def main(_):
 
     print(f"--- RUN ID: {cfg.run_id}")
     print(f"--- CONFIG: {args.config_module} | ALGO: {args.algo}")
+    print(f"--- REWARD MODEL: {args.reward_model_path} | SLICE INDEX: {args.reward_slice_index}")
+    print(f"--- ENTROPY REGULARIZATION: {cfg.ppo_entropy_regularization}")
 
     train_env = None
     eval_env = None
     try:
-        train_env = ran_env_wrapper.get_training_env(config_obj=cfg)
-        eval_env = ran_env_wrapper.get_eval_env(config_obj=cfg)
+        train_env = ran_env_adversarial_wrapper.get_training_env(
+            config_obj=cfg,
+            reward_model_path=args.reward_model_path,
+            reward_slice_index=args.reward_slice_index,
+            reward_prb_max=args.reward_prb_max,
+        )
+        eval_env = ran_env_adversarial_wrapper.get_eval_env(
+            config_obj=cfg,
+            reward_model_path=args.reward_model_path,
+            reward_slice_index=args.reward_slice_index,
+            reward_prb_max=args.reward_prb_max,
+        )
 
         agent = agent_builder.create_agent(train_env, algo=args.algo, config_obj=cfg)
 
@@ -189,7 +215,7 @@ def main(_):
             train_checkpointer.initialize_or_restore()
             print(f"Checkpoint restore enabled. Starting from step {int(agent.train_step_counter.numpy())}")
         else:
-            print("Fresh training run: checkpoint restore is disabled.")
+            print("Fresh adversarial training run: checkpoint restore is disabled.")
 
         train_summary_writer = tf.summary.create_file_writer(
             cfg.log_dir,
