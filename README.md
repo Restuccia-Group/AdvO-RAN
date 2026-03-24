@@ -18,7 +18,7 @@ This repo `saved_policy/em-max/em-agent-lp` as the default victim policy.
 | `requirements/` | Dependency manifests (`current.txt` and `legacy-tf23.txt`) |
 | `utils/` | Small helper scripts such as `run_actor_npz.py` |
 
-`saved_policy/em-max/em-agent-radial/` is an older artifact directory from the previous RADIAL workflow. The active robust training entry point is now `train_robust_policy.py`.
+
 
 ## Active Scripts
 
