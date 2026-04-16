@@ -27,7 +27,7 @@ Notes:
 Filter the raw dataset using allowed action combinations from `config_em_filtered.py`:
 
 ```bash
-python dataset/filter.py \
+python dataset/filter_by_action_combos.py\
   --input dataset/embb.csv \
   --output dataset/embb_filtered.csv
 ```
